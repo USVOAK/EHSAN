@@ -83,7 +83,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 DEFAULTS = {
     # Secret-ish prefix of the transport paths. Unique to this copy of the code.
     # NOTE: changing it invalidates links that were already handed out.
-    "PATH_PREFIX": "/static/38a217",
+    "PATH_PREFIX": "/api/v1/realtime",
     # Force one TLS fingerprint on all links (chrome, firefox, safari, ios,
     # android, edge, random, randomized). "" = use each link's own setting.
     "FP_OVERRIDE": "",
