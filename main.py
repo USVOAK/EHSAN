@@ -50,6 +50,7 @@ import base64
 import botgeneratedomin
 import bottokentcpproxy
 import zeussocks5
+import share
 from protocol.mtproto import mtproto_native as mtproto
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
@@ -83,6 +84,7 @@ app = FastAPI(title="RVG Gateway - codebox", docs_url=None, redoc_url=None)
 # به همین نمونه‌ی در حال اجرا اشاره می‌کنن.
 sys.modules.setdefault("main", sys.modules[__name__])
 
+app.add_middleware(share.PathAliasMiddleware)  # مسیرهای خنثی → مسیرهای داخلی RVG
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -90,6 +92,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── 404 عمومی ────────────────────────────────────────────────────────────────
+# پاسخ پیش‌فرض FastAPI ({"detail":"Not Found"}) خودش یک اثر انگشت است. برای مسیرهای
+# غیر از /api/ یک ۴۰۴ ساده برمی‌گردانیم؛ API پنل مثل قبل JSON می‌دهد.
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.exception_handlers import http_exception_handler as _default_http_exc
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _generic_404(request: Request, exc: StarletteHTTPException):
+    if share.DECOY and exc.status_code == 404 and not request.url.path.startswith("/api/"):
+        return HTMLResponse(share.NOT_FOUND_HTML, status_code=404)
+    return await _default_http_exc(request, exc)
 
 # ── Host detection (پلتفرم‌مستقل) ──────────────────────────────────────────────
 # قبلاً دامنه فقط از RAILWAY_PUBLIC_DOMAIN خونده می‌شد، پس روی Render یا دامنه‌ی
@@ -612,7 +627,7 @@ async def _update_mtproto_ad_tag(uuid: str, ad_tag: str):
             link["ad_tag"] = ad_tag
             link["ad_tag_status"] = "done"
             link["ad_tag_link"] = generate_share_link(
-                uuid, get_host(), remark=f"RVG-{link.get('label','')}", protocol="mtproto"
+                uuid, get_host(), remark=f"{link.get('label','')}", protocol="mtproto"
             )
 
         if inst["port"] != old_port and old_proxy_id and not manual_port:
@@ -690,54 +705,17 @@ def generate_share_link(uuid: str, host: str, remark: str = "RVG", protocol: str
     if protocol == "shadowsocks":
         cipher = link.get("ss_cipher", DEFAULT_CIPHER)
         password = link.get("ss_password", "")
-        return generate_ss_link(host, 443, cipher, password, remark)
+        return share.build_ss_link(host, 443, cipher, password, remark)
 
-    if protocol == "trojan-ws":
-        params = {
-            "security": "tls", "type": "ws", "host": host,
-            "path": "/trojan-ws", "sni": host, "fp": fp, "alpn": alpn,
-        }
-        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-        return f"trojan://{uuid}@{host}:443?{query}#{quote(remark)}"
+    # ساخت لینک VLESS/Trojan با همان منطق Lunel (ALPN به‌ازای ترنسپورت، path انکود‌شده)
+    return share.build_links(uuid, host, remark, protocol, fp)[0]
 
-    if protocol.startswith("trojan-xhttp-"):
-        mode = protocol.replace("trojan-xhttp-", "")
-        path = f"/txhttp-siz10/{mode}/{uuid}"
-        params = {
-            "security": "tls", "type": "xhttp", "mode": mode, "host": host,
-            "path": path, "sni": host, "fp": fp, "alpn": alpn,
-        }
-        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-        return f"trojan://{uuid}@{host}:443?{query}#{quote(remark)}"
-
-    if protocol == "vless-ws":
-        path = f"/ws/{uuid}"
-        params = {
-            "encryption": "none",
-            "security": "tls",
-            "type": "ws",
-            "host": host,
-            "path": path,
-            "sni": host,
-            "fp": fp,
-            "alpn": alpn,
-        }
-    else:
-        mode = protocol.replace("xhttp-", "")
-        path = f"/xhttp-siz10/{mode}/{uuid}"
-        params = {
-            "encryption": "none",
-            "security": "tls",
-            "type": "xhttp",
-            "mode": mode,
-            "host": host,
-            "path": path,
-            "sni": host,
-            "fp": fp,
-            "alpn": alpn,
-        }
-    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{host}:443?{query}#{quote(remark)}"
+def generate_share_links(uuid: str, host: str, remark: str, protocol: str = DEFAULT_PROTOCOL) -> list[str]:
+    """مثل generate_share_link ولی اگر CLEAN_ADDRESSES تنظیم شده باشد، یک لینک به‌ازای هر آدرس."""
+    if protocol in ("mtproto", "shadowsocks"):
+        return [generate_share_link(uuid, host, remark, protocol)]
+    fp = (LINKS.get(uuid) or {}).get("fingerprint", "chrome")
+    return share.build_links(uuid, host, remark, protocol, fp)
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -938,44 +916,49 @@ async def ensure_default_link():
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def root():
+    if share.DECOY:
+        return HTMLResponse(share.DECOY_HTML)
     from pages import HOME_HTML
     return HOME_HTML.replace("{version}", "9.2")
 
 @app.get("/health")
 async def health():
+    if share.DECOY:
+        return {"status": "ok"}
     return {"status": "ok", "connections": len(connections), "uptime": uptime()}
 
 # ── Subscription (single link) ────────────────────────────────────────────────
 @app.get("/sub/{uuid}")
-async def subscription_single(uuid: str):
+async def subscription_single(uuid: str, fmt: str = ""):
     async with LINKS_LOCK:
         link = LINKS.get(uuid)
     if not link or not is_link_allowed(link):
         raise HTTPException(status_code=404, detail="not found or inactive")
     host = get_host()
     proto = link.get("protocol", DEFAULT_PROTOCOL)
-    vless = generate_share_link(uuid, host, remark=f"RVG-{link['label']}", protocol=proto)
-    content = base64.b64encode(vless.encode()).decode()
+    vless_lines = generate_share_links(uuid, host, remark=link['label'], protocol=proto)
     headers = build_sub_headers(link["label"], link.get("used_bytes", 0), link.get("limit_bytes", 0), link.get("expires_at"))
-    return Response(content=content, media_type="text/plain", headers=headers)
+    content, media_type, headers = share.render(vless_lines, headers, fmt)
+    return Response(content=content, media_type=media_type, headers=headers)
 
 @app.get("/sub-all")
-async def subscription_all(_=Depends(require_auth)):
+async def subscription_all(fmt: str = "", _=Depends(require_auth)):
     host = get_host()
     async with LINKS_LOCK:
         allowed = [d for d in LINKS.values() if is_link_allowed(d)]
         lines = [
-            generate_share_link(uid, host, remark=f"RVG-{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL))
+            ln
             for uid, d in LINKS.items()
             if is_link_allowed(d)
+            for ln in generate_share_links(uid, host, remark=d['label'], protocol=d.get("protocol", DEFAULT_PROTOCOL))
         ]
         total_used = sum(d.get("used_bytes", 0) for d in allowed)
         total_limit = sum(d.get("limit_bytes", 0) for d in allowed)
         expiries = [d["expires_at"] for d in allowed if d.get("expires_at")]
     nearest_exp = min(expiries) if expiries else None
-    content = base64.b64encode("\n".join(lines).encode()).decode()
-    headers = build_sub_headers("RVG-All", total_used, total_limit, nearest_exp)
-    return Response(content=content, media_type="text/plain", headers=headers)
+    headers = build_sub_headers("All", total_used, total_limit, nearest_exp)
+    content, media_type, headers = share.render(lines, headers, fmt)
+    return Response(content=content, media_type=media_type, headers=headers)
 
 
 @app.get("/api/server/location")
@@ -1163,7 +1146,7 @@ async def node_assign_link_to_sub(sub_id: str, request: Request, key_id: str = D
 
 # ── Public sub-group subscription file ───────────────────────────────────────
 @app.get("/sub-group/{uuid_key}")
-async def sub_group_subscription(uuid_key: str, request: Request):
+async def sub_group_subscription(uuid_key: str, request: Request, fmt: str = ""):
     async with SUBS_LOCK:
         sub = next((s for s in SUBS.values() if s.get("uuid_key") == uuid_key), None)
     if not sub:
@@ -1181,7 +1164,7 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         for lid in link_ids:
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
-                lines.append(generate_share_link(lid, host, remark=f"RVG-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
+                lines.extend(generate_share_links(lid, host, remark=link['label'], protocol=link.get("protocol", DEFAULT_PROTOCOL)))
                 allowed_links.append(link)
         total_used = sum(l.get("used_bytes", 0) for l in allowed_links)
         total_limit = sum(l.get("limit_bytes", 0) for l in allowed_links)
@@ -1225,9 +1208,9 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         lines.append(vl)
         total_used += int(fl.get("used_bytes") or 0)
     nearest_exp = min(expiries) if expiries else None
-    content = base64.b64encode("\n".join(lines).encode()).decode()
     headers = build_sub_headers(f"پنل: {sub['name']}", total_used, total_limit, nearest_exp)
-    return Response(content=content, media_type="text/plain", headers=headers)
+    content, media_type, headers = share.render(lines, headers, fmt)
+    return Response(content=content, media_type=media_type, headers=headers)
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
 @app.post("/api/login")
@@ -1458,7 +1441,7 @@ async def api_mtproto_fix_proxy(request: Request, _=Depends(require_auth)):
         fixed.append({
             "uuid": uid, "label": label,
             "host": pub["domain"], "port": pub["port"],
-            "link": generate_share_link(uid, get_host(), remark=f"RVG-{label}", protocol="mtproto"),
+            "link": generate_share_link(uid, get_host(), remark=label, protocol="mtproto"),
         })
         log_activity("link", f"TCP Proxy عمومی «{label}» ساخته شد ({pub['domain']}:{pub['port']})", "ok")
 
@@ -1607,7 +1590,7 @@ async def api_bot_tcp_proxy_attach(request: Request, _=Depends(require_auth)):
 
     asyncio.create_task(save_state())
     host = get_host()
-    share_link = generate_share_link(uid, host, remark=f"RVG-{cur_label}", protocol="mtproto")
+    share_link = generate_share_link(uid, host, remark=cur_label, protocol="mtproto")
     if not attached_link:
         attached_link = {"uuid": uid, "label": cur_label}
     log_activity(
@@ -1815,8 +1798,7 @@ async def _create_link_core(body: dict) -> dict:
 
     alpn_val = str(body.get("alpn") or "h2,http/1.1").strip()[:60]
     fp_val = str(body.get("fingerprint") or "chrome").strip()[:20]
-    if fp_val not in ("chrome", "firefox", "ios"):
-        fp_val = "chrome"
+    fp_val = share.clean_fp(fp_val)
 
     uid = generate_uuid()
     link_data = {
@@ -1918,7 +1900,7 @@ async def _create_link_core(body: dict) -> dict:
         "uuid": uid,
         **LINKS[uid],
         "expired": False,
-        "vless_link": generate_share_link(uid, host, remark=f"RVG-{label}", protocol=protocol),
+        "vless_link": generate_share_link(uid, host, remark=label, protocol=protocol),
         "sub_url": f"https://{host}/sub/{uid}",
     }
 
@@ -1960,7 +1942,7 @@ async def list_links(_=Depends(require_auth)):
             **extra,
             "protocol": proto,
             "expired": is_link_expired(d),
-            "vless_link": generate_share_link(uid, host, remark=f"RVG-{d['label']}", protocol=proto),
+            "vless_link": generate_share_link(uid, host, remark=d['label'], protocol=proto),
             "sub_url": f"https://{host}/sub/{uid}",
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -2023,7 +2005,7 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                 link["alpn"] = alpn_val
         if "fingerprint" in body:
             fp_val = str(body["fingerprint"]).strip()
-            link["fingerprint"] = fp_val if fp_val in ("chrome", "firefox", "ios") else "chrome"
+            link["fingerprint"] = share.clean_fp(fp_val)
         if any(k in body for k in ("label", "note", "limit_value", "expires_days", "alpn", "fingerprint")):
             log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد", "info")
         new_sub = body.get("sub_id", "UNCHANGED")
@@ -2490,548 +2472,4 @@ async def connect_node(request: Request, _=Depends(require_auth)):
                 raise HTTPException(status_code=409, detail=f"این پنل قبلاً به‌عنوان «{n.get('label')}» متصل شده است")
 
     node_password = str(body.get("password") or "").strip()
-    candidate = {"host": host, "key": key}
-    try:
-        r = await _node_request(candidate, "POST", "/api/node/handshake",
-                                json_body={"host": get_host(), "version": get_current_version(),
-                                           "password": node_password})
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"اتصال به {host} برقرار نشد: {str(exc)[:160]}")
-    if r.status_code == 401:
-        detail = ""
-        try:
-            detail = r.json().get("detail") or ""
-        except Exception:
-            pass
-        if detail == "PASSWORD_REQUIRED":
-            raise HTTPException(status_code=401, detail="این نود رمز دارد؛ رمز را وارد کنید")
-        if detail == "PASSWORD_INVALID":
-            raise HTTPException(status_code=401, detail="رمز نود اشتباه است")
-        raise HTTPException(status_code=401, detail="کلید توسط پنل مقابل پذیرفته نشد (ابطال‌شده یا نامعتبر)")
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"پاسخ نامعتبر از {host}: HTTP {r.status_code}")
-    info = r.json()
-
-    label = (str(body.get("label") or "").strip() or info.get("host") or host)[:60]
-    node_id = generate_uuid()
-    node = _normalize_node({
-        "label": label, "host": host, "key": key,
-        "peer_version": info.get("version"),
-        "last_sync_at": datetime.now().isoformat(),
-    })
-    async with NODES_LOCK:
-        NODES[node_id] = node
-    _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
-    log_activity("node", f"به نود «{label}» ({host}) متصل شد", "ok")
-    return {"ok": True, "node": _node_public(node_id, node), "peer": info}
-
-
-@app.patch("/api/nodes/{node_id}")
-async def update_node(node_id: str, request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    async with NODES_LOCK:
-        node = NODES.get(node_id)
-        if node is None:
-            raise HTTPException(status_code=404, detail="node not found")
-        if "label" in body:
-            node["label"] = (str(body["label"]).strip() or node["host"])[:60]
-        if "enabled" in body:
-            node["enabled"] = bool(body["enabled"])
-        if "merge_dashboard" in body:
-            node["merge_dashboard"] = bool(body["merge_dashboard"])
-        share = body.get("share")
-        if isinstance(share, dict):
-            for p in NODE_SHARE_PARTS:
-                if p in share:
-                    node["share"][p] = bool(share[p])
-        snap = dict(node)
-    _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
-    return {"ok": True, "node": _node_public(node_id, snap)}
-
-
-@app.delete("/api/nodes/{node_id}")
-async def disconnect_node(node_id: str, _=Depends(require_auth)):
-    async with NODES_LOCK:
-        node = NODES.pop(node_id, None)
-    if node is None:
-        raise HTTPException(status_code=404, detail="node not found")
-    _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
-    log_activity("node", f"اتصال نود «{node.get('label')}» قطع شد", "warn")
-    return {"ok": True, "disconnected": node_id}
-
-
-async def _proxy_node_link_write(node_id: str, uid: str, method: str,
-                                 json_body: dict | None = None) -> dict:
-    async with NODES_LOCK:
-        node = NODES.get(node_id)
-        if node is None:
-            raise HTTPException(status_code=404, detail="node not found")
-        snap = dict(node)
-    try:
-        r = await _node_request(snap, method, f"/api/node/links/{uid}", json_body=json_body)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
-    if r.status_code >= 400:
-        detail = f"HTTP {r.status_code}"
-        try:
-            detail = r.json().get("detail") or detail
-        except Exception:
-            pass
-        raise HTTPException(status_code=r.status_code, detail=detail)
-    _NODE_CACHE.clear()
-    return r.json() if r.content else {"ok": True}
-
-
-@app.post("/api/nodes/{node_id}/subs")
-async def proxy_node_create_sub(node_id: str, request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    async with NODES_LOCK:
-        node = NODES.get(node_id)
-        if node is None:
-            raise HTTPException(status_code=404, detail="node not found")
-        snap = dict(node)
-    try:
-        r = await _node_request(snap, "POST", "/api/node/subs", json_body=body)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
-    if r.status_code >= 400:
-        detail = f"HTTP {r.status_code}"
-        try:
-            detail = r.json().get("detail") or detail
-        except Exception:
-            pass
-        raise HTTPException(status_code=r.status_code, detail=detail)
-    _NODE_CACHE.clear()
-    return r.json()
-
-
-async def _proxy_node_sub_write(node_id: str, sub_id: str, method: str,
-                                 json_body: dict | None = None) -> dict:
-    async with NODES_LOCK:
-        node = NODES.get(node_id)
-        if node is None:
-            raise HTTPException(status_code=404, detail="node not found")
-        snap = dict(node)
-    try:
-        r = await _node_request(snap, method, f"/api/node/subs/{sub_id}", json_body=json_body)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
-    if r.status_code >= 400:
-        detail = f"HTTP {r.status_code}"
-        try:
-            detail = r.json().get("detail") or detail
-        except Exception:
-            pass
-        raise HTTPException(status_code=r.status_code, detail=detail)
-    _NODE_CACHE.clear()
-    return r.json() if r.content else {"ok": True}
-
-
-@app.patch("/api/nodes/{node_id}/subs/{sub_id}")
-async def proxy_node_update_sub(node_id: str, sub_id: str, request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    return await _proxy_node_sub_write(node_id, sub_id, "PATCH", json_body=body)
-
-
-@app.delete("/api/nodes/{node_id}/subs/{sub_id}")
-async def proxy_node_delete_sub(node_id: str, sub_id: str, _=Depends(require_auth)):
-    return await _proxy_node_sub_write(node_id, sub_id, "DELETE")
-
-
-@app.post("/api/nodes/{node_id}/subs/{sub_id}/links")
-async def proxy_node_assign_link_to_sub(node_id: str, sub_id: str, request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    async with NODES_LOCK:
-        node = NODES.get(node_id)
-        if node is None:
-            raise HTTPException(status_code=404, detail="node not found")
-        snap = dict(node)
-    try:
-        r = await _node_request(snap, "POST", f"/api/node/subs/{sub_id}/links", json_body=body)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
-    if r.status_code >= 400:
-        detail = f"HTTP {r.status_code}"
-        try:
-            detail = r.json().get("detail") or detail
-        except Exception:
-            pass
-        raise HTTPException(status_code=r.status_code, detail=detail)
-    _NODE_CACHE.clear()
-    return r.json() if r.content else {"ok": True}
-
-
-@app.post("/api/nodes/{node_id}/links")
-async def proxy_node_create_link(node_id: str, request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    async with NODES_LOCK:
-        node = NODES.get(node_id)
-        if node is None:
-            raise HTTPException(status_code=404, detail="node not found")
-        snap = dict(node)
-    try:
-        r = await _node_request(snap, "POST", "/api/node/links", json_body=body)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"نود پاسخ نداد: {str(exc)[:160]}")
-    if r.status_code >= 400:
-        detail = f"HTTP {r.status_code}"
-        try:
-            detail = r.json().get("detail") or detail
-        except Exception:
-            pass
-        raise HTTPException(status_code=r.status_code, detail=detail)
-    _NODE_CACHE.clear()
-    return r.json()
-
-
-@app.patch("/api/nodes/{node_id}/links/{uid}")
-async def proxy_node_update_link(node_id: str, uid: str, request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    return await _proxy_node_link_write(node_id, uid, "PATCH", json_body=body)
-
-
-@app.delete("/api/nodes/{node_id}/links/{uid}")
-async def proxy_node_delete_link(node_id: str, uid: str, _=Depends(require_auth)):
-    return await _proxy_node_link_write(node_id, uid, "DELETE")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# VLESS Relay
-# ══════════════════════════════════════════════════════════════════════════════
-from protocol.vless.vless import (
-    RELAY_BUF,
-    parse_vless_header,
-    check_and_use,
-    relay_ws_to_tcp,
-    relay_tcp_to_ws,
-)
-from protocol.vless.websocket import websocket_tunnel
-
-from protocol.trojan.websocket import trojan_ws_tunnel
-
-app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
-app.add_api_websocket_route("/trojan-ws", trojan_ws_tunnel)
-from protocol.shadowsocks.shadowsocks import generate_ss_link, derive_key, CIPHERS, DEFAULT_CIPHER
-from protocol.shadowsocks.websocket import shadowsocks_ws_tunnel
-app.add_api_websocket_route("/ss-ws", shadowsocks_ws_tunnel)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# XHTTP
-# ══════════════════════════════════════════════════════════════════════════════
-# نکته: مطابق نسخه‌ی مرجع (xhttp_siz10.py) مود stream-one حذف شده؛ فقط
-# packet-up و stream-up فعال هستن. روترهای stream-one دیگه include نمی‌شن.
-from protocol.vless.xhttpstreamon import router as xhttp_downlink_router
-from protocol.vless.xhttpstreamup import router as xhttp_streamup_router
-from protocol.vless.xhttshadpacketup import router as xhttp_packetup_router
-app.include_router(xhttp_downlink_router)
-app.include_router(xhttp_streamup_router)
-app.include_router(xhttp_packetup_router)
-
-from protocol.trojan.xhttpstreamon import router as trojan_xhttp_downlink_router
-from protocol.trojan.xhttpstreamup import router as trojan_xhttp_streamup_router
-from protocol.trojan.xhttshadpacketup import router as trojan_xhttp_packetup_router
-app.include_router(trojan_xhttp_downlink_router)
-app.include_router(trojan_xhttp_streamup_router)
-app.include_router(trojan_xhttp_packetup_router)
-
-# ── HTTP Proxy ────────────────────────────────────────────────────────────────
-_HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
-        "te","trailers","transfer-encoding","upgrade","content-encoding","content-length"}
-
-@app.api_route("/proxy/{target_url:path}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
-async def http_proxy(target_url: str, request: Request):
-    if not target_url.startswith("http"):
-        target_url = "https://" + target_url
-    try:
-        body = await request.body()
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP and k.lower() != "host"}
-        resp = await http_client.request(method=request.method, url=target_url, headers=headers, content=body)
-        stats["total_bytes"] += len(resp.content)
-        stats["total_requests"] += 1
-        hourly_traffic[now_ir().strftime("%H:00")] += len(resp.content)
-        return Response(content=resp.content, status_code=resp.status_code,
-                        headers={k: v for k, v in resp.headers.items() if k.lower() not in _HOP})
-    except Exception as exc:
-        stats["total_errors"] += 1
-        error_logs.append({"error": str(exc), "url": target_url, "time": datetime.now().isoformat()})
-        raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
-
-# ── Public sub page ───────────────────────────────────────────────────────────
-@app.get("/p/{uuid_key}", response_class=HTMLResponse)
-async def public_sub_page(uuid_key: str, request: Request):
-    from pages import get_public_page_html
-    async with SUBS_LOCK:
-        sub = next(({"sub_id": sid, **s} for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
-    if not sub:
-        return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>گروه پیدا نشد</h2>", status_code=404)
-    return HTMLResponse(content=get_public_page_html(uuid_key))
-
-
-
-@app.get("/api/public/sub/{uuid_key}")
-async def public_sub_data(uuid_key: str, request: Request):
-    # ۱. احراز هویت و دریافت داده‌ها (همان منطق قبلی شما)
-    async with SUBS_LOCK:
-        sub_entry = next(((sid, s) for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
-    if not sub_entry:
-        raise HTTPException(status_code=404, detail="not found")
-    sub_id, sub = sub_entry
-
-    has_pw = sub.get("password_hash") is not None
-    if has_pw:
-        pw = request.query_params.get("pw", "")
-        if hash_password(pw) != sub["password_hash"]:
-            return JSONResponse({"locked": True, "name": sub["name"]})
-
-    host = get_host()
-    link_ids = sub.get("link_ids", [])
-    node_link_ids = sub.get("node_link_ids", [])
-    async with LINKS_LOCK:
-        snap = dict(LINKS)
-
-    links_out = []
-    active_conns = 0
     
-    # ۲. ساخت لیست کانفیگ‌ها
-    for lid in link_ids:
-        link = snap.get(lid)
-        if not link: continue
-        allowed = is_link_allowed(link)
-        conn_count = sum(1 for c in connections.values() if c.get("uuid") == lid)
-        active_conns += conn_count
-        proto = link.get("protocol", DEFAULT_PROTOCOL)
-        links_out.append({
-            "uuid": lid,
-            "label": link["label"],
-            "active": allowed,
-            "protocol": proto,
-            "used_bytes": link.get("used_bytes", 0),
-            "limit_bytes": link.get("limit_bytes", 0),
-            "vless_link": generate_share_link(lid, host, remark=f"RVG-{link['label']}", protocol=proto),
-        })
-
-    # ۲.۵ کانفیگ‌های نودهای دیگر
-    if node_link_ids:
-        async with NODES_LOCK:
-            nodes_snap = {nid: dict(n) for nid, n in NODES.items()}
-        needed_nodes = list({ref.split("::", 1)[0] for ref in node_link_ids if "::" in ref})
-        needed_nodes = [nid for nid in needed_nodes if nid in nodes_snap]
-        snapshots = await asyncio.gather(
-            *(_fetch_node_snapshot(nid, nodes_snap[nid], fresh=True) for nid in needed_nodes),
-            return_exceptions=True,
-        )
-        snap_by_node = dict(zip(needed_nodes, snapshots))
-        for ref in node_link_ids:
-            if "::" not in ref:
-                continue
-            nid, uid = ref.split("::", 1)
-            node_snap = snap_by_node.get(nid)
-            if not node_snap or isinstance(node_snap, Exception):
-                continue
-            node_link = next((l for l in (node_snap.get("links") or []) if l.get("uuid") == uid), None)
-            if not node_link or not node_link.get("vless_link"):
-                continue
-            lb = node_link.get("limit_bytes", 0)
-            allowed = bool(node_link.get("active", True)) and not node_link.get("expired") and not (lb > 0 and node_link.get("used_bytes", 0) >= lb)
-            links_out.append({
-                "uuid": nid + "::" + uid,
-                "label": node_link.get("label", uid),
-                "active": allowed,
-                "protocol": node_link.get("protocol", DEFAULT_PROTOCOL),
-                "used_bytes": node_link.get("used_bytes", 0),
-                "limit_bytes": node_link.get("limit_bytes", 0),
-                "vless_link": node_link["vless_link"],
-            })
-
-    # ۲.۶ کانفیگ‌های ایستا (foreign_links) — مثلاً کانفیگ‌های پنل مرکزی که روی
-    # یک نود اضافه شده‌اند؛ چون این نود به پنل مرکزی دسترسی برگشتی ندارد،
-    # این کانفیگ‌ها به‌صورت اسنپ‌شات (لینک آماده) ذخیره و همینجا نمایش داده می‌شوند.
-    for fl in sub.get("foreign_links", []):
-        vl = fl.get("vless_link")
-        if not vl:
-            continue
-        links_out.append({
-            "uuid": fl.get("key") or vl,
-            "label": fl.get("label", "کانفیگ"),
-            "active": True,
-            "protocol": fl.get("protocol", DEFAULT_PROTOCOL),
-            "used_bytes": fl.get("used_bytes", 0),
-            "limit_bytes": 0,
-            "vless_link": vl,
-        })
-
-    # ۳. تشخیص کلاینت یا مرورگر
-    user_agent = request.headers.get("User-Agent", "").lower()
-    is_client = any(ua in user_agent for ua in ["v2rayng", "v2rayn", "shadowrocket", "clash", "surfboard", "nekoray"])
-
-    if is_client:
-        # اگر کلاینت است: فقط لینک‌های فعال را به صورت Base64 برگردان
-        raw_links = "\n".join([l["vless_link"] for l in links_out if l["active"]])
-        encoded_data = base64.b64encode(raw_links.encode("utf-8")).decode("utf-8")
-        return Response(content=encoded_data, media_type="text/plain")
-
-    # ۴. اگر مرورگر است: دیتای کامل JSON را برگردان
-    return {
-        "locked": False,
-        "name": f"پنل: {sub['name']}",
-        "desc": sub.get("desc", ""),
-        "sub_url": f"https://{host}/sub-group/{uuid_key}",
-        "active_connections": active_conns,
-        "links": links_out, # اینجا همان لیست کامل شماست
-    }
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Version / Auto-Update
-# ══════════════════════════════════════════════════════════════════════════════
-from updater import (
-    get_current_version, get_current_version_info,
-    get_latest_version_info, perform_update,
-    update_log, update_state, load_update_history,
-    REPO, BRANCH, is_newer_version,
-)
-
-@app.get("/api/version")
-async def api_version(_=Depends(require_auth)):
-    current_info = get_current_version_info()
-    latest_info = await get_latest_version_info()
-    latest_ver = latest_info.get("version")
-    update_available = is_newer_version(latest_ver, current_info["version"]) if latest_ver else False
-    return {
-        "repo": REPO,
-        "branch": BRANCH,
-        "current": current_info,
-        "latest": latest_info,
-        "update_available": update_available,
-    }
-
-@app.get("/api/update-history")
-async def api_update_history(_=Depends(require_auth)):
-    return {"history": load_update_history()}
-
-@app.get("/api/update-log")
-async def api_update_log(_=Depends(require_auth)):
-    return {"running": update_state["running"], "progress": update_state["progress"], "logs": list(update_log)[-100:]}
-
-@app.post("/api/update")
-async def api_update(_=Depends(require_auth)):
-    if update_state["running"]:
-        raise HTTPException(status_code=409, detail="بروزرسانی در حال اجراست")
-    update_log.append({"time": time.time(), "msg": "درخواست بروزرسانی ثبت شد، در صف اجرا..."})
-
-    async def _run():
-        ok = False
-        try:
-            ok = await perform_update()
-        except Exception as exc:
-            import traceback as tb
-            update_log.append({"time": time.time(), "msg": f"❌ خطای بحرانی: {exc}"})
-            update_log.append({"time": time.time(), "msg": tb.format_exc()[-800:]})
-            update_state["running"] = False
-        try:
-            await save_state()
-            log_activity("system", "بروزرسانی پنل " + ("موفق" if ok else "ناموفق") + " بود", "ok" if ok else "err")
-        except Exception:
-            pass
-        if ok:
-            update_log.append({"time": time.time(), "msg": "در حال راه‌اندازی مجدد پروسه (بدون خاموش‌شدن کانتینر)..."})
-            await asyncio.sleep(1.5)
-            try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except Exception as exc:
-                update_log.append({"time": time.time(), "msg": f"❌ execv شکست خورد: {exc} — fallback به exit"})
-                os._exit(0)
-
-    task = asyncio.create_task(_run())
-
-    def _on_done(t: asyncio.Task):
-        if t.cancelled():
-            return
-        exc = t.exception()
-        if exc:
-            update_log.append({"time": time.time(), "msg": f"❌ Task crash: {exc}"})
-            update_state["running"] = False
-
-    task.add_done_callback(_on_done)
-    log_activity("system", "درخواست بروزرسانی پنل ثبت شد", "info")
-    return {"ok": True, "started": True}
-
-# ── Settings: توقف کامل لاگ‌گیری (برای بیشترین throughput ممکن) ─────────────────
-@app.get("/api/settings/logging")
-async def get_logging_setting(_=Depends(require_auth)):
-    return {"disabled": bool(CONFIG.get("disable_logging"))}
-
-
-@app.post("/api/settings/logging")
-async def set_logging_setting(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    disabled = bool(body.get("disabled"))
-    CONFIG["disable_logging"] = disabled
-    apply_logging_state()
-    await save_state()
-    return {"ok": True, "disabled": disabled}
-
-
-# ── HTML Pages ───────────────────────────────────────────────────────────────
-from pages import LOGIN_HTML, DASHBOARD_HTML
-
-# ── Central: Announcements & Support ─────────────────────────────────────────
-@app.get("/api/announcements")
-async def api_announcements(_=Depends(require_auth)):
-    return {"announcements": await central.fetch_announcements()}
-
-@app.post("/api/announcements/view")
-async def api_announcements_view(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    ids = body.get("ids", [])
-    if not isinstance(ids, list):
-        raise HTTPException(status_code=400, detail="invalid ids")
-    await central.report_announcement_views([str(i) for i in ids][:100])
-    return {"ok": True}
-
-@app.get("/api/support/messages")
-async def api_support_messages(_=Depends(require_auth)):
-    messages, blocked = await central.fetch_support_messages()
-    return {"messages": messages, "blocked": blocked}
-
-@app.post("/api/support/send")
-async def api_support_send(request: Request, _=Depends(require_auth)):
-    body = await request.json()
-    msg = str(body.get("message", "")).strip()[:2000]
-    if not msg:
-        raise HTTPException(status_code=400, detail="پیام خالی است")
-    result = await central.send_support_message(msg)
-    if result.get("blocked"):
-        raise HTTPException(status_code=403, detail="شما توسط پشتیبانی بلاک شده‌اید")
-    if not result.get("ok"):
-        raise HTTPException(status_code=502, detail=result.get("error") or "ارتباط با سرور مرکزی برقرار نشد")
-    return {"ok": True}
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request):
-    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/dashboard")
-    return HTMLResponse(content=LOGIN_HTML)
-
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/login")
-    await ensure_default_link()
-    return HTMLResponse(content=DASHBOARD_HTML)
-
-@app.get("/test-ws", response_class=HTMLResponse)
-async def test_ws_redirect():
-    return HTMLResponse(content="<script>location.href='/dashboard'</script>")
-
-if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=CONFIG["port"],
-        log_level="info",
-        workers=1,
-        loop="auto",         # uvloop رو در صورت نصب بودن استفاده می‌کنه، وگرنه بدون کرش fallback می‌کنه
-        http="auto",
-    )
