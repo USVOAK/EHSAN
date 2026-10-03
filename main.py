@@ -74,7 +74,7 @@ logger = logging.getLogger("RVG-Gateway")
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
-app = FastAPI(title="RVG Gateway - codebox", docs_url=None, redoc_url=None)
+app = FastAPI(title="RVG Gateway - codebox", docs_url=None, redoc_url=None, openapi_url=None)
 
 # وقتی مستقیم با `python main.py` اجرا میشه، این ماژول با نام "__main__" ثبت
 # میشه نه "main". چون protocol/vless/vless.py و protocol/trojan/trojan.py با
@@ -2471,5 +2471,4 @@ async def connect_node(request: Request, _=Depends(require_auth)):
             if n.get("host") == host:
                 raise HTTPException(status_code=409, detail=f"این پنل قبلاً به‌عنوان «{n.get('label')}» متصل شده است")
 
-    node_password = str(body.get("password") or "").strip()
-    
+    node_password = str(body.get("password") o
