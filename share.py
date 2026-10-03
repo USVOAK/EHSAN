@@ -22,8 +22,9 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Built-in settings — nothing needs to be configured.
-# These values work as-is. To change one, edit it here; an environment variable
-# with the same name (if you ever set one) takes priority over this table.
+# These values work as-is. To change one, edit it here. Environment variables
+# are deliberately ignored, so a stray variable on the hosting platform can never
+# change the behaviour (e.g. hide the login page).
 # ══════════════════════════════════════════════════════════════════════════════
 DEFAULTS = {
     # Secret-ish prefix of the transport paths. Unique to this copy of the code.
@@ -44,7 +45,7 @@ DEFAULTS = {
 
 
 def _setting(name: str) -> str:
-    return os.environ.get(name, DEFAULTS[name])
+    return DEFAULTS[name]
 
 
 # ── Neutral transport paths ───────────────────────────────────────────────────
