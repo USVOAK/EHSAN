@@ -32,15 +32,17 @@ from protocol.vless.vless import (
 
 
 async def websocket_tunnel(ws: WebSocket, uuid: str):
-    await ws.accept()
-
     async with LINKS_LOCK:
         link = LINKS.get(uuid)
 
+    # مقاومت در برابر probe فعال: UUID نامعتبر قبل از accept رد می‌شود (HTTP 403،
+    # بدون handshake وب‌سوکت)، پس چیزی شبیه «۱۰۱ و بعد قطع» دیده نمی‌شود.
     if not is_link_allowed(link):
         logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… (not allowed)")
-        await ws.close(code=1008, reason="not authorized")
+        await ws.close(code=1008)
         return
+
+    await ws.accept()
 
     ip = _ws_client_ip(ws)
     conn_id = secrets.token_urlsafe(6)
